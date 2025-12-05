@@ -19,6 +19,9 @@ from ..geoparams import geoparams
 from ..geoparams import geomag
 from ..psd import time_series_from_psd
 
+# JW: imports
+import numpy.typing as npt
+
 # global
 VERSION = '1.0'
 D2R = math.pi/180
@@ -99,7 +102,7 @@ def path_gen(ini_pos_vel_att, motion_def, output_def, mobility, ref_frame=0, mag
 
     ### Path gen command filter to make trajectory smoother
     alpha = 0.9                     # for the low pass filter of the motion commands
-    filt_a = alpha * np.eye(3)
+    filt_a = alpha * np.eye(3)      # JW: np.eye is identity matrix
     filt_b = (1-alpha) * np.eye(3)
     max_acc = mobility[0]           # 10.0m/s2, max acceleratoin
     max_dw = mobility[1]            # 0.5rad/s2    # max angular acceleration, rad/s/s
@@ -113,16 +116,18 @@ def path_gen(ini_pos_vel_att, motion_def, output_def, mobility, ref_frame=0, mag
 
     ### convert time duration to simulation cycles
     sim_count_max = 0
-    for i in range(0, motion_def.shape[0]):
+    for i in range(0, motion_def.shape[0]):  # JW: iterate through each motion command
         if motion_def[i, 7] < 0:
             raise ValueError("Time duration of %s-th command has negative time duration: %s."\
                              % (i, motion_def[i, 7]))
-        seg_count = motion_def[i, 7] * out_freq         # max count for this segment
-        sim_count_max += math.ceil(seg_count)           # data count of all segments
-        motion_def[i, 7] = round(seg_count * sim_osr)   # simulation count
+        seg_count = motion_def[i, 7] * out_freq         # max count for this segment # JW: no. of data points in this segment
+        sim_count_max += math.ceil(seg_count)           # data count of all segments # JW: total no of data points in motion profile. this gets overriden later...
+        motion_def[i, 7] = round(seg_count * sim_osr)   # simulation count           # JW: replaced from duration in seconds, to no. of data points
+    
     # total sim_count_max must be above 0
     if sim_count_max <= 0:
         raise ValueError("Total time duration in the motion definition file must be above 0.")
+    
     ### create output arrays
     sim_count_max = int(sim_count_max)
     imu_data = np.zeros((sim_count_max, 7))
@@ -130,34 +135,35 @@ def path_gen(ini_pos_vel_att, motion_def, output_def, mobility, ref_frame=0, mag
     enable_gps = False
     enable_odo = False
     if output_def.shape[0] == 3:
-        if output_def[1, 0] == 1:
+        if output_def[1, 0] == 1:  # JW: [gps_flag, freq]
             enable_gps = True
             gps_data = np.zeros((sim_count_max, 8))
-            output_def[1, 1] = sim_osr * round(out_freq / output_def[1, 1])
+            output_def[1, 1] = sim_osr * round(out_freq / output_def[1, 1])  # JW: simulate gps data only when multiples of this number
         else:
             output_def[1, 0] = -1
-        if output_def[2, 0] == 1:
+        if output_def[2, 0] == 1:  # JW: [odometer_flag, freq]
             enable_odo = True
             odo_data = np.zeros((sim_count_max, 5))
-            output_def[2, 1] = sim_osr * round(out_freq / output_def[2, 1])
+            output_def[2, 1] = sim_osr * round(out_freq / output_def[2, 1])  # JW: simulate odometer data only when multiples of this number
         else:
             output_def[2, 0] = -1
     else:
         raise ValueError("output_def should be of size 3x2.")
     if magnet:
         mag_data = np.zeros((sim_count_max, 4))
-
+    #
     ### start computations
     sim_count = 0               # number of total simulation data
     acc_sum = np.zeros(3)       # accum of over sampled simulated acc data
     gyro_sum = np.zeros(3)      # accum of over sampled simulated gyro data
     odo_dist = 0                # accum of travel distance
+    
     ## initialize
-    pos_n = ini_pos_vel_att[0:3]                # ini pos, LLA
-    vel_b = ini_pos_vel_att[3:6]                # ini vel
-    att = ini_pos_vel_att[6:9]                  # ini att
-    c_nb = attitude.euler2dcm(att, 'zyx').T     # b to n
-    vel_n = c_nb.dot(vel_b)
+    pos_n = ini_pos_vel_att[0:3]                # initial position, LLA
+    vel_b = ini_pos_vel_att[3:6]                # initial vel (JW: vel_b: body frame)
+    att = ini_pos_vel_att[6:9]                  # initial att (body frame)
+    c_nb = attitude.euler2dcm(att, 'zyx').T     # b to n (JW: tx matrix body to nav frame)
+    vel_n = c_nb.dot(vel_b)                     # JW: get velocity in nav frame
     pos_delta_n = np.zeros(3)                   # pos change
     earth_param = geoparams.geo_param(pos_n)    # geo parameters
     g = earth_param[2]                          # local gravity at ini pos
@@ -169,27 +175,35 @@ def path_gen(ini_pos_vel_att, motion_def, output_def, mobility, ref_frame=0, mag
         if ref_frame == 1:                      # remove inclination
             geo_mag_n[0] = math.sqrt(geo_mag_n[0]*geo_mag_n[0] + geo_mag_n[1]*geo_mag_n[1])
             geo_mag_n[1] = 0.0
+    
     ## start trajectory generation
     if ref_frame == 1:      # if using virtual inertial frame, convert LLA to ECEF xyz
         pos_n = geoparams.lla2ecef(pos_n)
+        
     idx_high_freq = 0       # data index for imu, nav, mag
     idx_low_freq = 0        # data index for gps, odo
-    for i in range(0, motion_def.shape[0]):
+    
+    for i in range(0, motion_def.shape[0]):     # JW: iterate through each motion command
         com_type = round(motion_def[i, 0])      # command type of this segment
         gps_visibility = motion_def[i, 8]       # gps visibility
         # get command of this segment
         '''if i == 2:
             print("haha")'''
         motion_com = parse_motion_def(motion_def[i], att, vel_b)
+        
         if com_type == 1:
+            # JW: figure out what is this dot_com
             att_dot_com = motion_com[0]
             vel_dot_com = motion_com[1]
         else:
+            # JW: target att and velocity to reach
             att_com = motion_com[0]
             vel_com_b = motion_com[1]
+            
         # initialize the filter states to last att and vel
         att_com_filt = att
         vel_com_b_filt = vel_b
+        
         # generate trajectory according to the command of this segment
         sim_count_max = sim_count + motion_def[i, 7]    # max cycles to execute command of this seg
         com_complete = 0                                # complete command of this seg, go to next
@@ -200,24 +214,30 @@ def path_gen(ini_pos_vel_att, motion_def, output_def, mobility, ref_frame=0, mag
                 vel_dot_b = filt_a.dot(vel_dot_b) + filt_b.dot(vel_dot_com)
                 # vel_dot_b = np.array(vel_dot_com)
             else:
-                att_com_filt = filt_a.dot(att_com_filt) + filt_b.dot(att_com)   # filter command
+                att_com_filt = filt_a.dot(att_com_filt) + filt_b.dot(att_com)   # filter command JW: this filter not used further
                 vel_com_b_filt = filt_a.dot(vel_com_b_filt) + filt_b.dot(vel_com_b)
+                
                 # Close the loop. Velocity change is acceleration and sudden change in acceleration
                 # is reasonable. Attitude change is angular velocity and sudden change in angular
                 # velocity means inifite torque, which is unreasonable. So a simple PD controller
                 # is used here to track the commanded attitude.
+                
                 # acc
                 vel_dot_b = (vel_com_b_filt - vel_b) / dt
                 vel_dot_b[vel_dot_b > max_acc] = max_acc          # limit acceleration
                 vel_dot_b[vel_dot_b < -max_acc] = -max_acc
+                
                 # w
-                att_dot_dot = kp*(att_com - att) + kd*(0 - att_dot) # feedback control
-                att_dot_dot[att_dot_dot > max_dw] = max_dw          # limit w change rate
+                att_dot_dot = kp*(att_com - att) + kd*(0 - att_dot) # feedback control    # JW: att acceleration
+                att_dot_dot[att_dot_dot > max_dw] = max_dw          # limit w change rate # JW: clamps for axes that exceed
                 att_dot_dot[att_dot_dot < -max_dw] = -max_dw
-                att_dot = att_dot + att_dot_dot*dt
-                att_dot[att_dot > max_w] = max_w                    # limit att change rate
+
+                att_dot = att_dot + att_dot_dot*dt                                           # JW: att rate
+                att_dot[att_dot > max_w] = max_w                    # limit att change rate  # JW: clamps for axes that exceed
                 att_dot[att_dot < -max_w] = -max_w
+                
                 # Complete the command of this segment?
+                # JW: check if target vel and att has been reached
                 if (np.sqrt(np.dot(att-att_com, att-att_com)) < att_converge_threshold and
                         np.sqrt(np.dot(vel_b-vel_com_b, vel_b-vel_com_b)) < vel_converge_threshold):
                     com_complete = 1
@@ -230,9 +250,11 @@ def path_gen(ini_pos_vel_att, motion_def, output_def, mobility, ref_frame=0, mag
             acc = imu_results[0]
             gyro = imu_results[1]
             pos_dot_n = imu_results[3]  # lla change rate if NED, vel_n if virtual inertial
+            
             # update IMU results
             acc_sum = acc_sum + acc
             gyro_sum = gyro_sum + gyro
+            
             # update GPS results
 
             # update odometer results
@@ -245,6 +267,7 @@ def path_gen(ini_pos_vel_att, motion_def, output_def, mobility, ref_frame=0, mag
                 # average over sampled IMU data
                 acc_avg = acc_sum / sim_osr
                 gyro_avg = gyro_sum / sim_osr
+                
                 # write to files
                 #imu_data[idx_high_freq, :] = np.hstack((idx_high_freq, acc_avg, gyro_avg))
                 imu_data[idx_high_freq, 0] = sim_count
@@ -254,6 +277,7 @@ def path_gen(ini_pos_vel_att, motion_def, output_def, mobility, ref_frame=0, mag
                 imu_data[idx_high_freq, 4] = gyro_avg[0]
                 imu_data[idx_high_freq, 5] = gyro_avg[1]
                 imu_data[idx_high_freq, 6] = gyro_avg[2]
+                
                 # nav data
                 nav_data[idx_high_freq, 0] = sim_count
                 nav_data[idx_high_freq, 1] = pos_n[0] + pos_delta_n[0]
@@ -266,9 +290,11 @@ def path_gen(ini_pos_vel_att, motion_def, output_def, mobility, ref_frame=0, mag
                 nav_data[idx_high_freq, 7] = euler_angles[0] # yaw [-pi, pi]
                 nav_data[idx_high_freq, 8] = euler_angles[1] # pitch [-pi/2, pi/2]
                 nav_data[idx_high_freq, 9] = euler_angles[2] # roll [-pi, pi]
+                
                 # next cycle
                 acc_sum = np.zeros(3)
                 gyro_sum = np.zeros(3)
+                
                 # update magnetometer results
                 if magnet:
                     geo_mag_b = c_nb.T.dot(geo_mag_n)
@@ -277,6 +303,7 @@ def path_gen(ini_pos_vel_att, motion_def, output_def, mobility, ref_frame=0, mag
                     mag_data[idx_high_freq, 1] = geo_mag_b[0]
                     mag_data[idx_high_freq, 2] = geo_mag_b[1]
                     mag_data[idx_high_freq, 3] = geo_mag_b[2]
+                
                 # update odometer results
                 if enable_odo:
                     #odo_data[idx_high_freq, :] = np.hstack((idx_high_freq,
@@ -286,8 +313,10 @@ def path_gen(ini_pos_vel_att, motion_def, output_def, mobility, ref_frame=0, mag
                     odo_data[idx_high_freq, 2] = odo_vel[0]
                     odo_data[idx_high_freq, 3] = odo_vel[1]
                     odo_data[idx_high_freq, 4] = odo_vel[2]
-                # index increment
+                
+                 # index increment
                 idx_high_freq += 1
+            
             # GPS or odometer measurement
             if enable_gps:
                 if (sim_count % output_def[1, 1]) == 0:     # measurement period
@@ -341,7 +370,7 @@ def calc_true_sensor_output(pos_n, vel_b, att, c_nb, vel_dot_b, att_dot, ref_fra
         pos_n: For NED, it is the absolute LLA position. Otherwise, it is relative
             motion.
         vel_b: Velocity in the body frame, m/s.
-        att: Euler angles, [yaw pitch roll], rot seq is ZYX, rad.
+        att: Euler angles, [yaw pitch roll], rot seq is ZYX, rad. # JW: body frame
         c_nb: Transformation matrix from b to n corresponding to att.
         vel_dot_b: Velocity change rate in the body frame, m/s/s
         att_dot: Euler angle change rate, [yaw_d, pitch_d, roll_d], rad/s
@@ -366,9 +395,9 @@ def calc_true_sensor_output(pos_n, vel_b, att, c_nb, vel_dot_b, att_dot, ref_fra
         rm = earth_param[0]
         rn = earth_param[1]
         g = earth_param[2]
-        sl = earth_param[3]
-        cl = earth_param[4]
-        w_ie = earth_param[5]
+        sl = earth_param[3]    # JW: sin(lat)
+        cl = earth_param[4]    # JW: cos(lat)
+        w_ie = earth_param[5]  # JW: earth rot rate (rad/s)
         rm_effective = rm + pos_n[2]
         rn_effective = rn + pos_n[2]
         gravity = np.array([0, 0, g])
@@ -382,17 +411,20 @@ def calc_true_sensor_output(pos_n, vel_b, att, c_nb, vel_dot_b, att_dot, ref_fra
 
     # Calculate rotation rate of b w.r.t n expressed in n.
     # Calculate rotation rate from Euler angle derivative using ZYX rot seq.
-    sh = math.sin(att[0])
-    ch = math.cos(att[0])
-    w_nb_n = np.zeros(3)
+    sh = math.sin(att[0])  # JW: sin(yaw)
+    ch = math.cos(att[0])  # JW: cos(yaw)
+    w_nb_n = np.zeros(3)                                  # JW: rotation rate of body in nav frame
     w_nb_n[0] = -sh*att_dot[1] + c_nb[0, 0]*att_dot[2]
     w_nb_n[1] = ch*att_dot[1] + c_nb[1, 0]*att_dot[2]
     w_nb_n[2] = att_dot[0] + c_nb[2, 0]*att_dot[2]
+    
     # Calculate rotation rate from rotation quaternion
     # w_nb_n = np.zeros(3)
 
     # Velocity derivative
+    # JW: velocity derivative in nav frame (acceleration)
     vel_dot_n = c_nb.dot(vel_dot_b) + attitude.cross3(w_nb_n, vel_n)
+    
     # Position derivative
     pos_dot_n = np.zeros(3)
     if ref_frame == 0:
@@ -400,15 +432,18 @@ def calc_true_sensor_output(pos_n, vel_b, att, c_nb, vel_dot_b, att_dot, ref_fra
         pos_dot_n[1] = vel_n[1] / rn_effective / cl # Lon
         pos_dot_n[2] = -vel_n[2]                    # Alt
     else:
+        # JW: pos_dot_n = vel_n
         pos_dot_n[0] = vel_n[0]
         pos_dot_n[1] = vel_n[1]
         pos_dot_n[2] = vel_n[2]
+
     # Gyroscope output
-    gyro = c_nb.T.dot(w_nb_n + w_en_n + w_ie_n)
+    gyro_b = c_nb.T.dot(w_nb_n + w_en_n + w_ie_n)  # JW: add rotation rates of components in nav frame, and transform to body frame with (c_nb.T)
+
     # Acceleration output
     w_ie_b = c_nb.T.dot(w_ie_n)
-    acc = vel_dot_b + attitude.cross3(w_ie_b+gyro, vel_b) - c_nb.T.dot(gravity)
-    return acc, gyro, vel_dot_n, pos_dot_n
+    acc = vel_dot_b + attitude.cross3(w_ie_b + gyro_b, vel_b) - c_nb.T.dot(gravity)
+    return acc, gyro_b, vel_dot_n, pos_dot_n
 
 def parse_motion_def(motion_def_seg, att, vel):
     """

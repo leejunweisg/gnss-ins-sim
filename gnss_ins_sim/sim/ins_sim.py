@@ -447,17 +447,25 @@ class Sim(object):
         '''
         # read motion definition
         [ini_pva, motion_def] = self.__parse_motion()
+        
         # output definitions
+        # JW: self.fs contains sample rate: [imu, gps, mag]. for IMU, first element is oversampling rate, second is sampling rate
+        # JW: output_def format: [imu, gps, odometer]
         output_def = np.array([[1.0, self.fs[0]], [1.0, self.fs[0]], [1.0, self.fs[0]]])
+        
+        # JW: set sampling rate for gps if it is enabled
         if self.imu.gps:
             output_def[1, 0] = 1.0
             output_def[1, 1] = self.fs[1]
         else:
             output_def[1, 0] = -1.0
+        
+        # JW: sampling rate of odometer (output_def[2, 1]) defaults to IMU sampling rate (self.fs[0])
         if self.imu.odo:
             output_def[2, 0] = 1.0
         else:
             output_def[2, 0] = -1.0
+        
         # sim mode-->vehicle maneuver capability
         mobility = self.__parse_mode(self.mode)
 
